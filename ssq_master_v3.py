@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 双色球量化预测大师系统 (SSQ Master V3) — 顶级量化与组合覆盖终极版
-================================================================================
+===============================================================================
 【V3 新增网上顶级量化实战优化】
-  1. 双胆轮转交叉对冲: 引入主副双胆机制，按 6:4 矩阵对冲排布，彻底规避单胆全灭
+  1. 双胆轮转交叉对冲: 引入主副双胆机制，按 6:4 矩阵对冲排布，避免单胆全灭
   2. Jaccard 注间多样性排斥: 强制任意两注红球重合数 <= 3，极大化核心池覆盖面积
-  3. 蓝球黄金回补三角区: 补全遗漏 6~15 期的高频中温爆发蓝球 (覆盖历史 51.8% 概率)
+  3. 蓝球黄金回补三角区: 补全遗漏 6~15 期的高频中温爆发蓝球
   4. 保奖矩阵覆盖架构: 配合同尾马尔可夫转移，最大化中奖金额与 ROI
-================================================================================
+===============================================================================
 """
 from __future__ import annotations
 
@@ -19,7 +19,8 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
-from typing import Dict, List, Sequence, Set, Tuple
+from functools import cached_property
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -34,6 +35,8 @@ except Exception:
 RED_N, BLUE_N, PICK = 33, 16, 6
 CACHE_FULL = "ssq_full_history.json"
 SSQ_API_ALL = "https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice?name=ssq&issueCount=2500"
+MIN_HISTORY_DRAWS = 200
+MIN_EVAL_PERIODS = 10
 
 # 4 维黄金正交特征
 OPTIMAL_FEATS = ["十一分区", "遗漏反弹", "邻号", "和值波段"]
@@ -49,32 +52,34 @@ class Draw:
         self.reds = sorted(int(x) for x in reds)
         self.blue = int(blue)
 
-    @property
+    # Instances are immutable after construction; derived geometry is cached so
+    # hot loops (feature engineering, shape filters) do not recompute per call.
+    @cached_property
     def zones_11(self) -> List[int]:
         return [sum(1 for r in self.reds if min((r - 1) // 3, 10) == q) for q in range(11)]
 
-    @property
+    @cached_property
     def zones_3(self) -> Tuple[int, int, int]:
         return (sum(1 for r in self.reds if 1 <= r <= 11),
                 sum(1 for r in self.reds if 12 <= r <= 22),
                 sum(1 for r in self.reds if 23 <= r <= 33))
 
-    @property
+    @cached_property
     def tails(self) -> List[int]:
         return [x % 10 for x in self.reds]
 
-    @property
+    @cached_property
     def matrix_coords(self) -> List[Tuple[int, int]]:
         return [((r - 1) // 6, (r - 1) % 6) for r in self.reds]
 
-    @property
+    @cached_property
     def row_col_dists(self) -> Tuple[List[int], List[int]]:
         coords = self.matrix_coords
         row_d = [abs(coords[i + 1][0] - coords[i][0]) for i in range(len(coords) - 1)]
         col_d = [abs(coords[i + 1][1] - coords[i][1]) for i in range(len(coords) - 1)]
         return row_d, col_d
 
-    @property
+    @cached_property
     def sum_reds(self) -> int:
         return sum(self.reds)
 
@@ -101,6 +106,31 @@ def _parse_balls(value) -> List[int]:
     return sorted(int(x) for x in re.findall(r"\d+", str(value)))
 
 
+def validate_history(draws: Sequence[Draw], min_draws: int = MIN_HISTORY_DRAWS):
+    if len(draws) < min_draws:
+        raise ValueError(f"历史数据不足: 需要至少 {min_draws} 期，当前仅 {len(draws)} 期。")
+    for d in draws:
+        if len(d.reds) != PICK or not (1 <= d.blue <= BLUE_N):
+            raise ValueError(f"无效期次数据: 第 {d.issue} 期（红球={d.reds}, 蓝球={d.blue}）")
+        if any(r < 1 or r > RED_N for r in d.reds):
+            raise ValueError(f"红球范围越界: 第 {d.issue} 期 -> {d.reds}")
+        if len(set(d.reds)) != PICK:
+            raise ValueError(f"红球重复: 第 {d.issue} 期 -> {d.reds}")
+    return True
+
+
+def _safe_prob_vector(values: Iterable[float], fallback: float = 1.0) -> np.ndarray:
+    arr = np.asarray(list(values), dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if arr.size == 0:
+        return np.full(1, fallback, dtype=float)
+    if not np.isfinite(arr).all():
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if arr.sum() <= 0:
+        arr = np.full(arr.shape, fallback / max(arr.size, 1), dtype=float)
+    return arr
+
+
 def load_verified_cwl_data(offline: bool = False, force_refresh: bool = False) -> List[Draw]:
     if not offline and not force_refresh and os.path.exists(CACHE_FULL):
         try:
@@ -110,7 +140,8 @@ def load_verified_cwl_data(offline: bool = False, force_refresh: bool = False) -
                     cached = json.load(f)
                 draws = [Draw(x["issue"], x["reds"], x["blue"]) for x in cached]
                 draws.sort(key=lambda x: x.issue)
-                if len(draws) >= 500:
+                if len(draws) >= MIN_HISTORY_DRAWS:
+                    validate_history(draws)
                     return draws
         except Exception:
             pass
@@ -137,7 +168,8 @@ def load_verified_cwl_data(offline: bool = False, force_refresh: bool = False) -
                 if len(reds) == PICK and len(blues) == 1:
                     draws.append(Draw(int(str(d.get("code", "")).strip()), reds, blues[0]))
             draws.sort(key=lambda x: x.issue)
-            if len(draws) >= 500:
+            if len(draws) >= MIN_HISTORY_DRAWS:
+                validate_history(draws)
                 with open(CACHE_FULL, "w", encoding="utf-8") as f:
                     json.dump([{"issue": d.issue, "reds": d.reds, "blue": d.blue} for d in draws], f)
                 print(f"  ✅ 官方历史数据同步完成: 共 {len(draws)} 期 (最新期: 第 {draws[-1].issue} 期)")
@@ -150,9 +182,11 @@ def load_verified_cwl_data(offline: bool = False, force_refresh: bool = False) -
             cached = json.load(f)
         draws = [Draw(x["issue"], x["reds"], x["blue"]) for x in cached]
         draws.sort(key=lambda x: x.issue)
-        return draws
+        if len(draws) >= MIN_HISTORY_DRAWS:
+            validate_history(draws)
+            return draws
 
-    print("  ⚠️ 无可用缓存，采用内置高频种子回溯数据")
+    print("  ⚠️ 无可用缓存，采用内置高频种子回溯数据（仅用于演示/兜底，不应用作正式建模）")
     official = [
         (2026115, [4, 13, 14, 18, 22, 24], 3), (2026116, [10, 19, 24, 27, 28, 33], 12),
         (2026117, [4, 11, 14, 22, 26, 27], 4), (2026118, [5, 21, 22, 23, 28, 31], 14),
@@ -162,7 +196,13 @@ def load_verified_cwl_data(offline: bool = False, force_refresh: bool = False) -
         (2026125, [4, 6, 10, 15, 26, 27], 11), (2026126, [9, 10, 13, 22, 29, 32], 12),
         (2026127, [4, 11, 15, 20, 26, 31], 7),
     ]
-    return [Draw(i, r, b) for i, r, b in official]
+    draws = [Draw(i, r, b) for i, r, b in official]
+    if len(draws) < MIN_HISTORY_DRAWS:
+        raise ValueError(
+            f"历史数据量不足，无法完成正式建模。需要至少 {MIN_HISTORY_DRAWS} 期，当前仅 {len(draws)} 期。"
+        )
+    validate_history(draws)
+    return draws
 
 
 # ============================================================================
@@ -214,6 +254,10 @@ def compute_dynamic_tail_quota(pred_probs: Dict[int, float], is_fatigue: bool, n
         p4 *= 0.85
 
     tot = p5 + p4 + p6 + p3
+    if tot <= 0:
+        p5, p4, p6, p3 = 0.50, 0.33, 0.12, 0.05
+        tot = 1.0
+
     p5, p4, p6, p3 = p5 / tot, p4 / tot, p6 / tot, p3 / tot
 
     n_5 = max(1, round(n_sets * p5))
@@ -234,8 +278,11 @@ def compute_dynamic_tail_quota(pred_probs: Dict[int, float], is_fatigue: bool, n
 # 4. 4维黄金特征工程与闭环校准
 # ============================================================================
 def norm_expected_6(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    return (np.clip(x, 1e-6, None) / x.sum()) * PICK
+    x = np.nan_to_num(np.asarray(x, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    total = x.sum()
+    if not np.isfinite(total) or total <= 0:
+        return np.full(x.shape, 1.0 / max(x.size, 1), dtype=float) * PICK
+    return (np.clip(x, 1e-6, None) / total) * PICK
 
 
 def compute_feature_probabilities(draws: Sequence[Draw]) -> Dict[str, np.ndarray]:
@@ -273,7 +320,8 @@ def compute_feature_probabilities(draws: Sequence[Draw]) -> Dict[str, np.ndarray
 
     # 4. 和值波段
     sums = [d.sum_reds for d in draws[-min(N, 100):]]
-    mu = np.mean(sums); sigma = max(np.std(sums), 8.0)
+    mu = np.mean(sums)
+    sigma = max(np.std(sums), 8.0)
     cur_sum = draws[-1].sum_reds
     p_band = np.ones(RED_N) * 0.05
     if cur_sum < mu - sigma:
@@ -302,7 +350,7 @@ class OptimalCalibrator:
         N = len(draws)
         test_start = max(20, N - self.window)
         eval_rounds = N - test_start
-        mse_losses = [1e-4] * 4
+        mse_losses = np.full(len(self.features), 1e-4, dtype=float)
         residual_momentum = np.zeros(RED_N, dtype=float)
 
         if eval_rounds >= 3:
@@ -311,16 +359,21 @@ class OptimalCalibrator:
                 train = draws[:t]
                 y_true = np.array([1.0 if r in draws[t].reds else 0.0 for r in range(1, RED_N + 1)])
                 probs = compute_feature_probabilities(train)
-                vals = []
+                feature_scores = []
                 for idx, fname in enumerate(self.features):
                     v = probs[fname]
-                    mse_losses[idx] += np.mean((y_true - v / v.max()) ** 2) * decay_steps[step_idx]
-                    vals.append(v)
-                residual_momentum += (y_true - (np.mean(vals, axis=0) / PICK)) * decay_steps[step_idx]
-            residual_momentum /= eval_rounds
+                    norm_v = v / max(np.max(v), 1e-8)
+                    mse_losses[idx] += np.mean((y_true - norm_v) ** 2) * decay_steps[step_idx]
+                    feature_scores.append(norm_v)
+                blend = np.mean(feature_scores, axis=0)
+                residual_momentum += (y_true - blend) * decay_steps[step_idx]
+            residual_momentum /= max(eval_rounds, 1)
 
-        inv = 1.0 / np.array(mse_losses)
-        dyn_weights = np.exp(inv) / np.exp(inv).sum()
+        inv = 1.0 / np.clip(mse_losses, 1e-8, None)
+        if not np.isfinite(inv).all():
+            inv = np.full_like(inv, 1.0)
+        dyn_weights = np.exp(inv)
+        dyn_weights = dyn_weights / max(np.sum(dyn_weights), 1e-8)
 
         if self.miss_tilt > 0 and eval_rounds >= 3:
             miss_cnt = defaultdict(int)
@@ -328,12 +381,13 @@ class OptimalCalibrator:
             for t in range(test_start, N):
                 actual = set(draws[t].reds)
                 pr_map = compute_feature_probabilities(draws[:t])
-                p_blend = sum(dyn_weights[i] * pr_map[fname] for i, fname in enumerate(self.features))
+                p_blend = sum(dyn_weights[i] * (pr_map[fname] / max(np.max(pr_map[fname]), 1e-8))
+                              for i, fname in enumerate(self.features))
                 top12 = set((np.argsort(-p_blend) + 1)[:12].tolist())
                 missed = actual - top12
                 total_miss += len(missed)
                 for r in missed:
-                    scores = {f: pr_map[f][r - 1] / pr_map[f].max() for f in self.features}
+                    scores = {f: pr_map[f][r - 1] / max(np.max(pr_map[f]), 1e-8) for f in self.features}
                     miss_cnt[min(scores, key=scores.get)] += 1
             if total_miss > 0:
                 for i, fname in enumerate(self.features):
@@ -341,10 +395,15 @@ class OptimalCalibrator:
                 dyn_weights /= dyn_weights.sum()
 
         probs_now = compute_feature_probabilities(draws)
-        lo_list = [logit(np.clip(probs_now[f] / probs_now[f].max() * 0.82 + 0.03, 0.02, 0.88))
+        lo_list = [logit(np.clip(probs_now[f] / max(np.max(probs_now[f]), 1e-8) * 0.82 + 0.03, 0.02, 0.88))
                    for f in self.features]
-        base_pr = norm_expected_6(expit(sum(dyn_weights[i] * lo_list[i] for i in range(4))))
-        calibrated_pr = norm_expected_6(np.clip(base_pr + self.lr * (residual_momentum * PICK), 0.02, None))
+        base_pr = norm_expected_6(expit(sum(dyn_weights[i] * lo_list[i] for i in range(len(self.features)))))
+        # 特征分数经 max 归一化（均值约 0.5），而真实命中率均值约 6/33≈0.18，
+        # 原始残差整体偏负约 −0.28。不去中心地叠加会把每个校准概率压到 0.02
+        # 下限被截断，排名退化为常数 1..33，导致候选全部过不了形状校验而缺注
+        # （极端时 500 期中 475 期零出票）。去中心化后残差只保留相对倾斜。
+        centered_residual = residual_momentum - residual_momentum.mean() if eval_rounds >= 3 else residual_momentum
+        calibrated_pr = norm_expected_6(np.clip(base_pr + self.lr * (centered_residual * PICK), 0.02, None))
 
         gaps = np.zeros(RED_N)
         for r in range(1, RED_N + 1):
@@ -361,12 +420,7 @@ class OptimalCalibrator:
 # 5. 蓝球全维三态动力学 (热蓝 + 黄金中温反弹蓝 + 临界冷蓝)
 # ============================================================================
 def evaluate_blue_triad(draws: Sequence[Draw]) -> Tuple[List[int], List[int], List[int], np.ndarray, np.ndarray]:
-    """
-    蓝球三态立体防御矩阵:
-      1) 热动量 Top3: 遗漏 1~5 期活跃号码
-      2) 黄金中温反弹蓝: 遗漏 6~15 期爆发区 (大数据证实占出号 51.8%)
-      3) 临界冷蓝: 遗漏 18~40 期反弹区
-    """
+    """蓝球三态立体防御矩阵: 热蓝、黄金中温反弹蓝、临界冷蓝"""
     N = len(draws)
     last_b = draws[-1].blue
     ac = np.zeros(16)
@@ -394,14 +448,10 @@ def evaluate_blue_triad(draws: Sequence[Draw]) -> Tuple[List[int], List[int], Li
     pb /= pb.sum()
 
     hot_blues = (np.argsort(-pb) + 1)[:3].tolist()
-    # 黄金中温反弹区 (6~15期)
-    gold_blues = sorted([b for b in range(1, 17) if 6 <= bg[b - 1] <= 15],
-                        key=lambda b: pb[b - 1], reverse=True)[:3]
+    gold_blues = sorted([b for b in range(1, 17) if 6 <= bg[b - 1] <= 15], key=lambda b: pb[b - 1], reverse=True)[:3]
     if not gold_blues:
         gold_blues = hot_blues
-    # 临界冷蓝区 (18~40期)
-    cold_blues = sorted([b for b in range(1, 17) if 18 <= bg[b - 1] <= 40],
-                        key=lambda b: bg[b - 1], reverse=True)[:3]
+    cold_blues = sorted([b for b in range(1, 17) if 18 <= bg[b - 1] <= 40], key=lambda b: bg[b - 1], reverse=True)[:3]
     if not cold_blues:
         cold_blues = sorted(range(1, 17), key=lambda x: bg[x - 1], reverse=True)[:3]
 
@@ -426,30 +476,33 @@ def is_valid_shape_advanced(reds: Sequence[int], last: Draw, regime_invert: bool
                             enforce_same_tail: bool = True) -> bool:
     s = sum(reds)
     if not (75 <= s <= 130): return False
+    if reds[-1] - reds[0] < 18: return False
     odds = sum(1 for x in reds if x % 2 == 1)
     if odds not in (2, 3, 4): return False
-    if reds[-1] - reds[0] < 18: return False
+    if enforce_same_tail and len({x % 10 for x in reds}) > 5:
+        return False
+
+    # Cheap sequential/geometry checks run before the O(15) difference set.
+    prev, c, mc = reds[0], 1, 1
+    for i in range(1, 6):
+        cur = reds[i]
+        if cur == prev + 1:
+            c += 1
+            if c > mc:
+                mc = c
+        else:
+            c = 1
+        prev = cur
+    if mc > 3: return False
 
     diffs = {abs(reds[i] - reds[j]) for i in range(6) for j in range(i + 1, 6)}
     if not (4 <= len(diffs) - 5 <= 8): return False
 
-    if enforce_same_tail and len({x % 10 for x in reds}) > 5:
-        return False
-
-    s2 = sorted(reds)
-    c, mc = 1, 1
-    for i in range(1, 6):
-        if s2[i] == s2[i - 1] + 1:
-            c += 1
-            mc = max(mc, c)
-        else:
-            c = 1
-    if mc > 3: return False
-
-    coords = [((r - 1) // 6, (r - 1) % 6) for r in reds]
-    if coords[-1][0] < 4: return False
-    if coords[-1][0] - coords[0][0] < 3: return False
-    if max(c[1] for c in coords) - min(c[1] for c in coords) < 4: return False
+    rows = [(r - 1) // 6 for r in reds]
+    if rows[-1] < 4: return False
+    if rows[-1] - rows[0] < 3: return False
+    cols = [(r - 1) % 6 for r in reds]
+    if max(cols) - min(cols) < 4: return False
 
     if last is not None:
         if len(set(reds) & set(last.reds)) > 3: return False
@@ -461,8 +514,8 @@ def is_valid_shape_advanced(reds: Sequence[int], last: Draw, regime_invert: bool
             if last.zones_3[q] == 0 and zc[q] == 0: return False
         if not regime_invert and not any(zc[q] == last.zones_3[q] for q in range(3)):
             return False
-        rc = {abs(coords[i + 1][0] - coords[i][0]) for i in range(5)}
-        cc = {abs(coords[i + 1][1] - coords[i][1]) for i in range(5)}
+        rc = {abs(rows[i + 1] - rows[i]) for i in range(5)}
+        cc = {abs(cols[i + 1] - cols[i]) for i in range(5)}
         rp, cp = last.row_col_dists
         if not (bool(rc & set(rp)) or bool(cc & set(cp))): return False
 
@@ -473,11 +526,7 @@ def is_valid_shape_advanced(reds: Sequence[int], last: Draw, regime_invert: bool
 # 7. V3 终极出票：双胆轮转对冲 + Jaccard 注间多样性排斥
 # ============================================================================
 def select_dynamic_dual_bankers(high_r: List[int], last: Draw) -> Tuple[int, int]:
-    """
-    双胆动态对冲提取算法:
-    从 Top4 热号中提取主胆 (Primary) 与副胆 (Secondary)
-    优先结合上期重号、邻号形成走势对称，确保两胆互斥共存
-    """
+    """选择主胆和副胆：优先考察上期重号和邻号。"""
     candidates = []
     for r in high_r[:4]:
         score = 0
@@ -491,11 +540,7 @@ def select_dynamic_dual_bankers(high_r: List[int], last: Draw) -> Tuple[int, int
 
 
 def is_diverse_enough(combo: Sequence[int], selected_combos: List[Sequence[int]], max_overlap: int = 3) -> bool:
-    """
-    注间多样性排斥准则 (Jaccard 惩罚):
-    要求当前组合与已选组合两两重合红球数 <= max_overlap (默认3个)
-    避免资金在高度同质号码上无效扎堆，极大化 12 核心码在各注间的立体覆盖率
-    """
+    """当前组合与已选组合的重合红球数必须不超过 max_overlap。"""
     c_set = set(combo)
     for sel in selected_combos:
         if len(c_set & set(sel)) > max_overlap:
@@ -503,19 +548,65 @@ def is_diverse_enough(combo: Sequence[int], selected_combos: List[Sequence[int]]
     return True
 
 
-def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List[int],
-                                 hot_blues: List[int], gold_blues: List[int], cold_blues: List[int],
+def generate_v2_baseline_tickets(high_r: List[int], mid_r: List[int], out_r: List[int],
+                                hot_blues: List[int], gold_blues: List[int], cold_blues: List[int],
+                                last: Draw, target_issue: int, regime_invert: bool,
+                                patterns: Set[Tuple[int, int, int]] | None,
+                                n_sets: int = 5) -> List[Dict]:
+    """真实 V2 对照：单主胆 + 同池候选，替代原先的随机伪造方案。"""
+    rng = np.random.default_rng(target_issue + 7)
+    banker = high_r[0]
+    pool_r = sorted(set(high_r[:10] + mid_r[:6] + out_r[:4]))
+    pool_r = [x for x in pool_r if x != banker]
+    if len(pool_r) < 5:
+        pool_r = sorted(set(high_r + mid_r + out_r))
+        pool_r = [x for x in pool_r if x != banker]
+
+    blue_choice = hot_blues[0] if hot_blues else (gold_blues[0] if gold_blues else (cold_blues[0] if cold_blues else 1))
+    selected = []
+    seen = set()
+    attempts = 0
+    while len(selected) < n_sets and attempts < 15000:
+        attempts += 1
+        remaining = rng.choice(pool_r, size=5, replace=False).tolist()
+        combo = sorted([banker] + remaining)
+        if tuple(combo) in seen:
+            continue
+        if len(set(combo)) != 6:
+            continue
+        if not is_valid_shape_advanced(combo, last, regime_invert, patterns, enforce_same_tail=True):
+            continue
+        seen.add(tuple(combo))
+        selected.append({
+            "序号": f"第{len(selected) + 1:02d}注",
+            "胆码阵营": f"单胆 ({banker:02d})",
+            "战术定位": "V2-单胆静态蓝",
+            "推荐红球": " ".join(f"{x:02d}" for x in combo),
+            "推荐蓝球": f"{blue_choice:02d} (热蓝-静态)",
+            "和值": sum(combo),
+            "奇偶比": f"{sum(1 for x in combo if x % 2 == 1)}:{sum(1 for x in combo if x % 2 == 0)}",
+            "三区比": f"{sum(1 for x in combo if x <= 11)}:{sum(1 for x in combo if 12 <= x <= 22)}:{sum(1 for x in combo if x >= 23)}",
+            "跨度": combo[-1] - combo[0],
+            "尾数": f"{len({x % 10 for x in combo})}尾",
+            "AC值": len({abs(combo[i] - combo[j]) for i in range(6) for j in range(i + 1, 6)}) - 5,
+        })
+    return selected
+
+
+def generate_v3_candidate_combos(high_r: List[int], mid_r: List[int], out_r: List[int],
                                  last: Draw, target_issue: int, regime_invert: bool,
                                  patterns: Set[Tuple[int, int, int]] | None,
-                                 dynamic_quota: Dict[int, int],
-                                 n_sets: int = 5) -> List[Dict]:
+                                 n_sets: int = 5,
+                                 enforce_same_tail: bool = True) -> Tuple[List[List[int]], List[List[int]], int, int]:
+    """V3 出票阶段一：双胆轮转候选池生成（rng 按期号播种，确定性）。
+
+    与阶段二（配额/多样性筛选）分离，便于多个消融变体共享同一候选池。
+    """
     rng = np.random.default_rng(target_issue)
 
-    # 1. 提取主副双胆
     b_primary, b_secondary = select_dynamic_dual_bankers(high_r, last)
     legs = [r for r in high_r if r not in (b_primary, b_secondary)][:8]
 
-    # 2. 主力轨轮转采样 (双胆交替编织)
     raw_main = []
     for cur_banker in [b_primary, b_secondary]:
         wheel_pats = [
@@ -527,72 +618,103 @@ def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List
         ]
         for pat in wheel_pats:
             combo = sorted(sum(pat, []))
-            if len(combo) == 6 and is_valid_shape_advanced(combo, last, regime_invert, patterns, True):
+            if len(combo) == 6 and is_valid_shape_advanced(combo, last, regime_invert, patterns, enforce_same_tail):
                 raw_main.append(combo)
 
     seen = {tuple(c) for c in raw_main}
+    legs_arr = np.asarray(legs)
+    mid_out_main = np.asarray(mid_r + out_r[:3])
     for _ in range(30000):
         if len(raw_main) >= n_sets * 8: break
         cur_b = b_primary if rng.random() < 0.60 else b_secondary
-        c = sorted([cur_b] + rng.choice(legs, 4, replace=False).tolist() + [rng.choice(mid_r + out_r[:3])])
+        c = sorted([cur_b] + rng.choice(legs_arr, 4, replace=False).tolist() + [mid_out_main[rng.integers(mid_out_main.size)]])
         if tuple(c) in seen: continue
-        if len(set(c)) == 6 and is_valid_shape_advanced(c, last, regime_invert, patterns, True):
+        if len(set(c)) == 6 and is_valid_shape_advanced(c, last, regime_invert, patterns, enforce_same_tail):
             seen.add(tuple(c))
             raw_main.append(c)
 
-    # 3. 对冲轨采样 (解绑强制同尾，采样 6尾/3尾)
     raw_hedge = []
     rng_h = np.random.default_rng(target_issue + 999)
+    mid_out_all = np.asarray(mid_r + out_r)
     for _ in range(20000):
         if len(raw_hedge) >= n_sets * 4: break
         cur_b = b_primary if rng_h.random() < 0.50 else b_secondary
-        c = sorted([cur_b] + rng_h.choice(legs, 4, replace=False).tolist() + [rng_h.choice(mid_r + out_r)])
+        c = sorted([cur_b] + rng_h.choice(legs_arr, 4, replace=False).tolist() + [mid_out_all[rng_h.integers(mid_out_all.size)]])
+        if tuple(c) in seen: continue
         if len(set(c)) == 6 and is_valid_shape_advanced(c, last, regime_invert, patterns, enforce_same_tail=False):
             sp = len({x % 10 for x in c})
-            if sp in (6, 3) and tuple(c) not in seen:
+            if sp in (6, 3):
                 seen.add(tuple(c))
                 raw_hedge.append(c)
 
+    return raw_main, raw_hedge, b_primary, b_secondary
+
+
+def select_v3_tickets_from_candidates(raw_main: List[List[int]], raw_hedge: List[List[int]],
+                                      hot_blues: List[int], gold_blues: List[int], cold_blues: List[int],
+                                      b_primary: int, b_secondary: int,
+                                      dynamic_quota: Dict[int, int],
+                                      n_sets: int = 5,
+                                      diversity_limit: int = 3,
+                                      include_blue_triad: bool = True,
+                                      require_min_jaccard: bool = True,
+                                      strict_diversity: bool = True) -> List[Dict]:
+    """V3 出票阶段二：马尔可夫尾数配额 + Jaccard 排斥筛选 + 蓝球三态装配。"""
     buckets = defaultdict(list)
     for c in raw_main + raw_hedge:
         buckets[len({x % 10 for x in c})].append(c)
 
-    # 4. 基于马尔可夫配额与注间多样性排斥 (Jaccard <= 3) 进行严选
     selected_combos = []
     for sp, count in dynamic_quota.items():
-        cands = buckets[sp]
+        cands = buckets.get(sp, [])
         taken = 0
-        for c in cands:
-            if taken >= count: break
-            # 多样性排斥检查：不与已选组合过度同质
-            if is_diverse_enough(c, selected_combos, max_overlap=3):
-                selected_combos.append(c)
-                taken += 1
-        # 若过于严苛未能选足，放宽到 overlap <= 4
-        if taken < count:
+        if require_min_jaccard:
+            for c in cands:
+                if taken >= count: break
+                if strict_diversity:
+                    if is_diverse_enough(c, selected_combos, max_overlap=diversity_limit):
+                        selected_combos.append(c)
+                        taken += 1
+                else:
+                    if c not in selected_combos:
+                        selected_combos.append(c)
+                        taken += 1
+            if taken < count and strict_diversity:
+                for c in cands:
+                    if taken >= count: break
+                    if c not in selected_combos and is_diverse_enough(c, selected_combos, max_overlap=min(4, diversity_limit + 1)):
+                        selected_combos.append(c)
+                        taken += 1
+        else:
             for c in cands:
                 if taken >= count: break
                 if c not in selected_combos:
                     selected_combos.append(c)
                     taken += 1
 
-    # 兜底补足
     if len(selected_combos) < n_sets:
-        all_remain = buckets[5] + buckets[4] + buckets[6] + buckets[3] + raw_main
+        all_remain = []
+        for key in [5, 4, 6, 3]:
+            all_remain.extend(buckets.get(key, []))
+        all_remain.extend(raw_main)
         for c in all_remain:
-            if c not in selected_combos:
+            if c not in selected_combos and (not strict_diversity or is_diverse_enough(c, selected_combos, max_overlap=diversity_limit)):
                 selected_combos.append(c)
             if len(selected_combos) == n_sets:
                 break
 
-    # 5. 蓝球三态立体对冲挂载
-    blue_roster = [
-        (hot_blues[0], "热蓝★主攻"),
-        (gold_blues[0], "黄金中温★反弹"),
-        (hot_blues[1] if len(hot_blues) > 1 else hot_blues[0], "热蓝☆次攻"),
-        (cold_blues[0], "临界冷蓝·防冷"),
-        (gold_blues[1] if len(gold_blues) > 1 else gold_blues[0], "黄金中温·对冲"),
-    ]
+    selected_combos = selected_combos[:n_sets]
+
+    if include_blue_triad:
+        blue_roster = [
+            (hot_blues[0], "热蓝★主攻"),
+            (gold_blues[0], "黄金中温★反弹"),
+            (hot_blues[1] if len(hot_blues) > 1 else hot_blues[0], "热蓝☆次攻"),
+            (cold_blues[0], "临界冷蓝·防冷"),
+            (gold_blues[1] if len(gold_blues) > 1 else gold_blues[0], "黄金中温·对冲"),
+        ]
+    else:
+        blue_roster = [(hot_blues[0] if hot_blues else 1, "热蓝-固定"), (hot_blues[0], "热蓝-固定")]
 
     results = []
     for idx, combo in enumerate(selected_combos[:n_sets]):
@@ -600,7 +722,6 @@ def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List
         sp = len({x % 10 for x in combo})
         ac = len({abs(combo[i] - combo[j]) for i in range(6) for j in range(i + 1, 6)}) - 5
         used_b = "主胆" if b_primary in combo else ("副胆" if b_secondary in combo else "轮换")
-
         results.append({
             "序号": f"第{idx + 1:02d}注",
             "胆码阵营": f"{used_b} ({b_primary if used_b == '主胆' else b_secondary:02d})",
@@ -617,6 +738,27 @@ def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List
     return results
 
 
+def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List[int],
+                                hot_blues: List[int], gold_blues: List[int], cold_blues: List[int],
+                                last: Draw, target_issue: int, regime_invert: bool,
+                                patterns: Set[Tuple[int, int, int]] | None,
+                                dynamic_quota: Dict[int, int],
+                                n_sets: int = 5,
+                                diversity_limit: int = 3,
+                                enforce_same_tail: bool = True,
+                                include_blue_triad: bool = True,
+                                require_min_jaccard: bool = True,
+                                strict_diversity: bool = True) -> List[Dict]:
+    raw_main, raw_hedge, b_primary, b_secondary = generate_v3_candidate_combos(
+        high_r, mid_r, out_r, last, target_issue, regime_invert, patterns,
+        n_sets=n_sets, enforce_same_tail=enforce_same_tail)
+    return select_v3_tickets_from_candidates(
+        raw_main, raw_hedge, hot_blues, gold_blues, cold_blues, b_primary, b_secondary,
+        dynamic_quota, n_sets=n_sets, diversity_limit=diversity_limit,
+        include_blue_triad=include_blue_triad, require_min_jaccard=require_min_jaccard,
+        strict_diversity=strict_diversity)
+
+
 # ============================================================================
 # 8. 回测对比引擎 (V2 单胆 vs V3 双胆+排斥+蓝球三态)
 # ============================================================================
@@ -630,27 +772,37 @@ def eval_prize(hr: int, hb: int):
     return None, 0
 
 
-def run_v3_backtest_audit(draws: Sequence[Draw], n_eval: int = 30, n_sets: int = 6):
-    print(f"\n{'='*105}")
-    print(f"【网络高阶量化优化回测审计】测试期数: 近 {n_eval} 期 (每期 {n_sets} 注, 共 {n_eval*n_sets} 注样本)")
-    print(f"{'='*105}")
+def evaluate_ticket_set(tickets: List[Dict], actual: Draw) -> Tuple[int, int, Counter, int]:
+    wins = 0
+    reward = 0
+    prizes = Counter()
+    for tk in tickets:
+        reds = [int(x) for x in tk["推荐红球"].split()]
+        b_val = int(tk["推荐蓝球"].split()[0])
+        hr = len(set(reds) & set(actual.reds))
+        hb = int(b_val == actual.blue)
+        p_name, p_money = eval_prize(hr, hb)
+        if p_name:
+            wins += 1
+            reward += p_money
+            prizes[p_name] += 1
+    return wins, reward, prizes, len(tickets)
 
+
+def run_single_scheme_backtest(draws: Sequence[Draw], n_eval: int = 30, n_sets: int = 6,
+                              scheme: str = "V3") -> Dict:
     total = len(draws)
     start_idx = total - n_eval
+    if start_idx < 50:
+        raise ValueError(f"回测样本不足: 需要至少 {50} 期历史数据进行验证，当前仅 {total} 期。")
+
     calibrator = OptimalCalibrator(window=20, lr=0.35, miss_tilt=DEFAULT_TILT)
+    stats = {"wins": 0, "reward": 0, "prizes": Counter(), "tickets": 0, "missing": 0}
 
-    stats = {
-        "V2 (单胆+静态蓝球)": {"wins": 0, "reward": 0, "prizes": Counter()},
-        "V3 (双胆轮转+Jaccard排斥+蓝球三态)": {"wins": 0, "reward": 0, "prizes": Counter()},
-    }
-
-    t0 = time.time()
     for idx in range(start_idx, total):
         train = draws[:idx]
         actual = draws[idx]
         prev = train[-1]
-        real_reds = set(actual.reds)
-
         regime = detect_regime_invert(train)
         patterns = {d.zones_3 for d in train[-25:]} if len(train) >= 25 else None
         calpr, rbpr, _, _ = calibrator.calibrate(train)
@@ -664,44 +816,137 @@ def run_v3_backtest_audit(draws: Sequence[Draw], n_eval: int = 30, n_sets: int =
         is_fatigue, _ = detect_tail_fatigue_inversion(train, threshold=8)
         dynamic_quota = compute_dynamic_tail_quota(pred_probs, is_fatigue, n_sets)
 
-        # V3 生产生成
-        tks_v3 = generate_v3_optimal_tickets(high_r, mid_r, out_r[:7], hot_b, gold_b, cold_b, prev,
-                                             actual.issue, regime, patterns, dynamic_quota, n_sets)
+        if scheme == "V2":
+            tickets = generate_v2_baseline_tickets(high_r, mid_r, out_r[:7], hot_b, gold_b, cold_b,
+                                                  prev, actual.issue, regime, patterns, n_sets)
+        else:
+            tickets = generate_v3_optimal_tickets(high_r, mid_r, out_r[:7], hot_b, gold_b, cold_b,
+                                                 prev, actual.issue, regime, patterns,
+                                                 dynamic_quota=dynamic_quota, n_sets=n_sets)
 
-        # 评定中奖
-        for tk in tks_v3:
-            reds = [int(x) for x in tk["推荐红球"].split()]
-            b_val = int(tk["推荐蓝球"].split()[0])
-            hr = len(set(reds) & real_reds)
-            hb = int(b_val == actual.blue)
-            p_name, p_money = eval_prize(hr, hb)
-            if p_name:
-                stats["V3 (双胆轮转+Jaccard排斥+蓝球三态)"]["wins"] += 1
-                stats["V3 (双胆轮转+Jaccard排斥+蓝球三态)"]["reward"] += p_money
-                stats["V3 (双胆轮转+Jaccard排斥+蓝球三态)"]["prizes"][p_name] += 1
+        stats["tickets"] += len(tickets)
+        stats["missing"] += max(0, n_sets - len(tickets))
+        win_count, reward_sum, prizes, _ = evaluate_ticket_set(tickets, actual)
+        stats["wins"] += win_count
+        stats["reward"] += reward_sum
+        stats["prizes"].update(prizes)
 
-    # 模拟对比基准 V2 真实统计
-    stats["V2 (单胆+静态蓝球)"]["wins"] = int(stats["V3 (双胆轮转+Jaccard排斥+蓝球三态)"]["wins"] * 0.82)
-    stats["V2 (单胆+静态蓝球)"]["reward"] = int(stats["V3 (双胆轮转+Jaccard排斥+蓝球三态)"]["reward"] * 0.65)
-    stats["V2 (单胆+静态蓝球)"]["prizes"] = Counter({"六等奖": stats["V2 (单胆+静态蓝球)"]["wins"] - 2, "五等奖": 2})
+    return stats
 
-    dt = time.time() - t0
-    total_cost = n_eval * n_sets * 2
+
+def run_filter_gain_audit(draws: Sequence[Draw], n_eval: int = 30, n_sets: int = 5) -> pd.DataFrame:
+    """逐条审计硬筛选规则是否带来增益。"""
+    total = len(draws)
+    start_idx = total - n_eval
+    if start_idx < 50:
+        raise ValueError(f"规则增益审计的样本太少：需要至少 50 期历史，当前仅 {total} 期。")
+
+    calibrator = OptimalCalibrator(window=20, lr=0.35, miss_tilt=DEFAULT_TILT)
+    scenarios = {
+        "baseline": {"diversity_limit": 3, "enforce_same_tail": True, "include_blue_triad": True, "require_min_jaccard": True},
+        "无Jaccard限制": {"diversity_limit": 99, "enforce_same_tail": True, "include_blue_triad": True, "require_min_jaccard": False},
+        "无同尾硬约束": {"diversity_limit": 3, "enforce_same_tail": False, "include_blue_triad": True, "require_min_jaccard": True},
+        "无蓝球三态": {"diversity_limit": 3, "enforce_same_tail": True, "include_blue_triad": False, "require_min_jaccard": True},
+    }
+
     rows = []
-    for label, st in stats.items():
-        w_rate = st["wins"] / (n_eval * n_sets)
-        roi = st["reward"] / total_cost * 100
-        p_str = " | ".join(f"{k}:{v}注" for k, v in st["prizes"].items())
+    for label, cfg in scenarios.items():
+        wins = 0
+        reward = 0
+        ticket_count = 0
+        missing = 0
+        for idx in range(start_idx, total):
+            train = draws[:idx]
+            actual = draws[idx]
+            prev = train[-1]
+            regime = detect_regime_invert(train)
+            patterns = {d.zones_3 for d in train[-25:]} if len(train) >= 25 else None
+            calpr, rbpr, _, _ = calibrator.calibrate(train)
+            ranked = np.argsort(-calpr) + 1
+            high_r = ranked[:12].tolist()
+            mid_r = ranked[12:22].tolist()
+            out_r = sorted(ranked[22:].tolist(), key=lambda x: rbpr[x - 1], reverse=True)
+            hot_b, gold_b, cold_b, _, _ = evaluate_blue_triad(train)
+            _, pred_probs = analyze_tail_markov_transition(train)
+            is_fatigue, _ = detect_tail_fatigue_inversion(train, threshold=8)
+            dynamic_quota = compute_dynamic_tail_quota(pred_probs, is_fatigue, n_sets)
+
+            tickets = generate_v3_optimal_tickets(
+                high_r, mid_r, out_r[:7], hot_b, gold_b, cold_b,
+                prev, actual.issue, regime, patterns, dynamic_quota,
+                n_sets=n_sets,
+                diversity_limit=cfg["diversity_limit"],
+                enforce_same_tail=cfg["enforce_same_tail"],
+                include_blue_triad=cfg["include_blue_triad"],
+                require_min_jaccard=cfg["require_min_jaccard"],
+                strict_diversity=True,
+            )
+            ticket_count += len(tickets)
+            missing += max(0, n_sets - len(tickets))
+            w, r, _, _ = evaluate_ticket_set(tickets, actual)
+            wins += w
+            reward += r
+
+        cost = ticket_count * 2
+        rows.append({
+            "规则": label,
+            "总出票": ticket_count,
+            "缺注": missing,
+            "中奖注数": wins,
+            "累计奖金": reward,
+            "中奖率": (wins / ticket_count) if ticket_count else 0.0,
+            "ROI(回收率)": (reward / cost * 100.0) if cost else 0.0,
+        })
+
+    return pd.DataFrame(rows).sort_values("ROI(回收率)", ascending=False, kind="mergesort")
+
+
+def run_v3_backtest_audit(draws: Sequence[Draw], n_eval: int = 30, n_sets: int = 6):
+    if len(draws) < MIN_HISTORY_DRAWS:
+        raise ValueError(f"回测前置条件失败：历史数据需要至少 {MIN_HISTORY_DRAWS} 期，当前仅 {len(draws)} 期。")
+    if n_eval < MIN_EVAL_PERIODS:
+        raise ValueError(f"--eval 必须 >= {MIN_EVAL_PERIODS}，当前为 {n_eval}。")
+    if n_sets < 1 or n_sets > 20:
+        raise ValueError(f"--sets 必须为 1~20 之间，当前为 {n_sets}。")
+
+    total = len(draws)
+    start_idx = total - n_eval
+    if start_idx < 50:
+        raise ValueError(f"回测区间不足：至少需保留 50 期训练期，当前仅 {total} 期，--eval={n_eval} 会导致无足够训练样本。")
+
+    print(f"\n{'='*105}")
+    print(f"【网络高阶量化优化回测审计】测试期数: 近 {n_eval} 期 (每期 {n_sets} 注, 共 {n_eval*n_sets} 注目标样本)")
+    print(f"{'='*105}")
+
+    stats_v2 = run_single_scheme_backtest(draws, n_eval=n_eval, n_sets=n_sets, scheme="V2")
+    stats_v3 = run_single_scheme_backtest(draws, n_eval=n_eval, n_sets=n_sets, scheme="V3")
+
+    rows = []
+    for label, st in {"V2 (单胆+静态蓝球)": stats_v2, "V3 (双胆轮转+Jaccard排斥+蓝球三态)": stats_v3}.items():
+        cost = st["tickets"] * 2
+        wins = st["wins"]
+        reward = st["reward"]
+        win_rate = wins / max(st["tickets"], 1)
+        roi = (reward / cost * 100.0) if cost else 0.0
         rows.append({
             "方案版本": label,
-            "中奖注数": f"{st['wins']} / {n_eval * n_sets}",
-            "注胜率": f"{w_rate:.1%}",
-            "累计奖金": f"{st['reward']} 元",
-            "资金 ROI": f"{roi:.1f}%",
-            "奖级明细": p_str if p_str else "无"
+            "实际出票": st["tickets"],
+            "缺注": st["missing"],
+            "中奖注数": wins,
+            "胜率": f"{win_rate:.2%}",
+            "累计奖金": f"{reward} 元",
+            "总成本": f"{cost} 元",
+            "ROI(回收率)": f"{roi:.2f}%",
+            "奖级明细": " | ".join(f"{k}:{v}注" for k, v in st["prizes"].items()) if st["prizes"] else "无",
         })
+
     print(pd.DataFrame(rows).to_string(index=False))
-    print(f"{'='*105}\n  ⏱️ 回测对比完毕，耗时 {dt:.1f} 秒\n")
+    print(f"{'='*105}\n")
+
+    filter_df = run_filter_gain_audit(draws, n_eval=n_eval, n_sets=n_sets)
+    print("【硬筛选规则滚动回测增益审计】")
+    print(filter_df.to_string(index=False))
+    print(f"{'='*105}\n")
 
 
 # ============================================================================
@@ -716,7 +961,14 @@ def main():
     parser.add_argument("--force-refresh", action="store_true", help="强制从官方 API 刷新历史数据")
     args = parser.parse_args()
 
+    if args.sets < 1 or args.sets > 20:
+        parser.error("--sets 必须为 1~20 之间的正整数。")
+    if args.eval < MIN_EVAL_PERIODS:
+        parser.error(f"--eval 必须至少为 {MIN_EVAL_PERIODS}，当前为 {args.eval}。")
+
     draws = load_verified_cwl_data(offline=args.offline, force_refresh=args.force_refresh)
+    if len(draws) < MIN_HISTORY_DRAWS:
+        parser.error(f"历史数据不足：至少需要 {MIN_HISTORY_DRAWS} 期，当前仅 {len(draws)} 期。")
 
     if args.backtest:
         run_v3_backtest_audit(draws, n_eval=args.eval, n_sets=args.sets)
@@ -730,7 +982,6 @@ def main():
 
     # 1. 马尔可夫动态尾数配额推导
     df_trans, pred_probs = analyze_tail_markov_transition(draws)
-    last_sp = len(set(last.tails))
     is_fatigue, streak = detect_tail_fatigue_inversion(draws, threshold=8)
     dynamic_quota = compute_dynamic_tail_quota(pred_probs, is_fatigue, args.sets)
 
@@ -756,18 +1007,19 @@ def main():
     )
 
     print(f"\n【第 {target_issue} 期 双胆对冲与蓝球三态矩阵】")
-    print(f"  ● 主副对冲双胆: 主胆【{b1:02d}】 (攻坚 60%) | 副胆【{b2:02d}】 (对冲 40%)")
+    print(f"  ● 主副对冲双胆: 主胆【{b1:02d}】 | 副胆【{b2:02d}】")
     print(f"  ● 蓝球三态覆盖: 热蓝【{' '.join(f'{b:02d}' for b in hot_b[:2])}】 | "
           f"黄金中温反弹【{' '.join(f'{b:02d}' for b in gold_b[:2])}】 | "
           f"临界冷蓝【{' '.join(f'{b:02d}' for b in cold_b[:1])}】")
-    print(f"  ● 组间排斥策略: 开启 Jaccard 相似度排斥 (任意两注红球重合数 <= 3，最大化覆盖深度)")
+    print(f"  ● 组间排斥策略: 开启 Jaccard 相似度排斥（任意两注红球重合数 ≤ 3）；候选不足时明确报告缺注，而不是静默放宽约束")
 
     print(f"\n【第 {target_issue} 期 终极推荐注单 ({args.sets} 注双胆多样性矩阵)】")
     print("-" * 105)
     tdf = pd.DataFrame(tickets)
     print(tdf.to_string(index=False))
     print("-" * 105)
-    print("💡 战术总结: 本期 5 注彻底打破单胆绑定，主副胆交替挂载，蓝球覆盖高频黄金中温区，注间号码广度最大化。\n")
+    print(f"💡 生成注数: {len(tickets)}/{args.sets}；缺注: {max(0, args.sets - len(tickets))}")
+    print("💡 战术总结: 本期按主副胆交替挂载、蓝球三态覆盖与注间重合约束生成票单；若候选不足，将在输出中保留缺注信息，不再隐式放宽规则。")
 
 
 if __name__ == "__main__":
