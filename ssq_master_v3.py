@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
+from functools import cached_property
 from typing import Dict, Iterable, List, Sequence, Set, Tuple
 from urllib.request import Request, urlopen
 
@@ -51,32 +52,34 @@ class Draw:
         self.reds = sorted(int(x) for x in reds)
         self.blue = int(blue)
 
-    @property
+    # Instances are immutable after construction; derived geometry is cached so
+    # hot loops (feature engineering, shape filters) do not recompute per call.
+    @cached_property
     def zones_11(self) -> List[int]:
         return [sum(1 for r in self.reds if min((r - 1) // 3, 10) == q) for q in range(11)]
 
-    @property
+    @cached_property
     def zones_3(self) -> Tuple[int, int, int]:
         return (sum(1 for r in self.reds if 1 <= r <= 11),
                 sum(1 for r in self.reds if 12 <= r <= 22),
                 sum(1 for r in self.reds if 23 <= r <= 33))
 
-    @property
+    @cached_property
     def tails(self) -> List[int]:
         return [x % 10 for x in self.reds]
 
-    @property
+    @cached_property
     def matrix_coords(self) -> List[Tuple[int, int]]:
         return [((r - 1) // 6, (r - 1) % 6) for r in self.reds]
 
-    @property
+    @cached_property
     def row_col_dists(self) -> Tuple[List[int], List[int]]:
         coords = self.matrix_coords
         row_d = [abs(coords[i + 1][0] - coords[i][0]) for i in range(len(coords) - 1)]
         col_d = [abs(coords[i + 1][1] - coords[i][1]) for i in range(len(coords) - 1)]
         return row_d, col_d
 
-    @property
+    @cached_property
     def sum_reds(self) -> int:
         return sum(self.reds)
 
@@ -478,7 +481,7 @@ def is_valid_shape_advanced(reds: Sequence[int], last: Draw, regime_invert: bool
     if enforce_same_tail and len({x % 10 for x in reds}) > 5:
         return False
 
-    s2 = sorted(reds)
+    s2 = reds  # callers always pass sorted combos; span check above already relies on it
     c, mc = 1, 1
     for i in range(1, 6):
         if s2[i] == s2[i - 1] + 1:
@@ -582,17 +585,15 @@ def generate_v2_baseline_tickets(high_r: List[int], mid_r: List[int], out_r: Lis
     return selected
 
 
-def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List[int],
-                                hot_blues: List[int], gold_blues: List[int], cold_blues: List[int],
-                                last: Draw, target_issue: int, regime_invert: bool,
-                                patterns: Set[Tuple[int, int, int]] | None,
-                                dynamic_quota: Dict[int, int],
-                                n_sets: int = 5,
-                                diversity_limit: int = 3,
-                                enforce_same_tail: bool = True,
-                                include_blue_triad: bool = True,
-                                require_min_jaccard: bool = True,
-                                strict_diversity: bool = True) -> List[Dict]:
+def generate_v3_candidate_combos(high_r: List[int], mid_r: List[int], out_r: List[int],
+                                 last: Draw, target_issue: int, regime_invert: bool,
+                                 patterns: Set[Tuple[int, int, int]] | None,
+                                 n_sets: int = 5,
+                                 enforce_same_tail: bool = True) -> Tuple[List[List[int]], List[List[int]], int, int]:
+    """V3 出票阶段一：双胆轮转候选池生成（rng 按期号播种，确定性）。
+
+    与阶段二（配额/多样性筛选）分离，便于多个消融变体共享同一候选池。
+    """
     rng = np.random.default_rng(target_issue)
 
     b_primary, b_secondary = select_dynamic_dual_bankers(high_r, last)
@@ -613,10 +614,12 @@ def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List
                 raw_main.append(combo)
 
     seen = {tuple(c) for c in raw_main}
+    legs_arr = np.asarray(legs)
+    mid_out_main = np.asarray(mid_r + out_r[:3])
     for _ in range(30000):
         if len(raw_main) >= n_sets * 8: break
         cur_b = b_primary if rng.random() < 0.60 else b_secondary
-        c = sorted([cur_b] + rng.choice(legs, 4, replace=False).tolist() + [rng.choice(mid_r + out_r[:3])])
+        c = sorted([cur_b] + rng.choice(legs_arr, 4, replace=False).tolist() + [rng.choice(mid_out_main)])
         if tuple(c) in seen: continue
         if len(set(c)) == 6 and is_valid_shape_advanced(c, last, regime_invert, patterns, enforce_same_tail):
             seen.add(tuple(c))
@@ -624,16 +627,31 @@ def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List
 
     raw_hedge = []
     rng_h = np.random.default_rng(target_issue + 999)
+    mid_out_all = np.asarray(mid_r + out_r)
     for _ in range(20000):
         if len(raw_hedge) >= n_sets * 4: break
         cur_b = b_primary if rng_h.random() < 0.50 else b_secondary
-        c = sorted([cur_b] + rng_h.choice(legs, 4, replace=False).tolist() + [rng_h.choice(mid_r + out_r)])
+        c = sorted([cur_b] + rng_h.choice(legs_arr, 4, replace=False).tolist() + [rng_h.choice(mid_out_all)])
+        if tuple(c) in seen: continue
         if len(set(c)) == 6 and is_valid_shape_advanced(c, last, regime_invert, patterns, enforce_same_tail=False):
             sp = len({x % 10 for x in c})
-            if sp in (6, 3) and tuple(c) not in seen:
+            if sp in (6, 3):
                 seen.add(tuple(c))
                 raw_hedge.append(c)
 
+    return raw_main, raw_hedge, b_primary, b_secondary
+
+
+def select_v3_tickets_from_candidates(raw_main: List[List[int]], raw_hedge: List[List[int]],
+                                      hot_blues: List[int], gold_blues: List[int], cold_blues: List[int],
+                                      b_primary: int, b_secondary: int,
+                                      dynamic_quota: Dict[int, int],
+                                      n_sets: int = 5,
+                                      diversity_limit: int = 3,
+                                      include_blue_triad: bool = True,
+                                      require_min_jaccard: bool = True,
+                                      strict_diversity: bool = True) -> List[Dict]:
+    """V3 出票阶段二：马尔可夫尾数配额 + Jaccard 排斥筛选 + 蓝球三态装配。"""
     buckets = defaultdict(list)
     for c in raw_main + raw_hedge:
         buckets[len({x % 10 for x in c})].append(c)
@@ -710,6 +728,27 @@ def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List
             "AC值": ac,
         })
     return results
+
+
+def generate_v3_optimal_tickets(high_r: List[int], mid_r: List[int], out_r: List[int],
+                                hot_blues: List[int], gold_blues: List[int], cold_blues: List[int],
+                                last: Draw, target_issue: int, regime_invert: bool,
+                                patterns: Set[Tuple[int, int, int]] | None,
+                                dynamic_quota: Dict[int, int],
+                                n_sets: int = 5,
+                                diversity_limit: int = 3,
+                                enforce_same_tail: bool = True,
+                                include_blue_triad: bool = True,
+                                require_min_jaccard: bool = True,
+                                strict_diversity: bool = True) -> List[Dict]:
+    raw_main, raw_hedge, b_primary, b_secondary = generate_v3_candidate_combos(
+        high_r, mid_r, out_r, last, target_issue, regime_invert, patterns,
+        n_sets=n_sets, enforce_same_tail=enforce_same_tail)
+    return select_v3_tickets_from_candidates(
+        raw_main, raw_hedge, hot_blues, gold_blues, cold_blues, b_primary, b_secondary,
+        dynamic_quota, n_sets=n_sets, diversity_limit=diversity_limit,
+        include_blue_triad=include_blue_triad, require_min_jaccard=require_min_jaccard,
+        strict_diversity=strict_diversity)
 
 
 # ============================================================================

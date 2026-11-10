@@ -23,6 +23,20 @@ import ssq_master_v3 as engine
 
 class StableAuditCalibrator(engine.OptimalCalibrator):
     """Audit-only calibrator with finite, normalized inverse-loss weights."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # compute_feature_probabilities(draws[:t]) is a pure function of the prefix
+        # length t: walk-forward reuses overlapping prefixes across calibration
+        # rounds and periods, so memoize per calibrator instance (one per audit).
+        self._prob_cache: Dict[int, Dict[str, np.ndarray]] = {}
+
+    def _feature_probs(self, draws, t: int):
+        cached = self._prob_cache.get(t)
+        if cached is None:
+            cached = engine.compute_feature_probabilities(draws[:t])
+            self._prob_cache[t] = cached
+        return cached
+
     def calibrate(self, draws):
         n = len(draws)
         start = max(20, n - self.window)
@@ -32,7 +46,7 @@ class StableAuditCalibrator(engine.OptimalCalibrator):
         if rounds >= 3:
             decay = np.exp(np.linspace(-0.8, 0.0, rounds))
             for k, t in enumerate(range(start, n)):
-                maps = engine.compute_feature_probabilities(draws[:t])
+                maps = self._feature_probs(draws, t)
                 actual = np.array([float(r in draws[t].reds) for r in range(1, engine.RED_N + 1)])
                 scores = [maps[name] / max(float(np.max(maps[name])), 1e-12) for name in self.features]
                 for i, score in enumerate(scores):
@@ -45,7 +59,7 @@ class StableAuditCalibrator(engine.OptimalCalibrator):
             missed_counts = Counter()
             total_missed = 0
             for t in range(start, n):
-                maps = engine.compute_feature_probabilities(draws[:t])
+                maps = self._feature_probs(draws, t)
                 blend = sum(weights[i] * maps[name] / max(float(np.max(maps[name])), 1e-12)
                             for i, name in enumerate(self.features))
                 missed = set(draws[t].reds) - set((np.argsort(-blend) + 1)[:12].tolist())
@@ -58,10 +72,15 @@ class StableAuditCalibrator(engine.OptimalCalibrator):
                 weights *= np.array([1 + self.miss_tilt * missed_counts[name] / total_missed
                                      for name in self.features])
                 weights /= weights.sum()
-        current = engine.compute_feature_probabilities(draws)
+        current = self._feature_probs(draws, n)
         logits = [engine.logit(np.clip(current[name] / max(float(np.max(current[name])), 1e-12) * .82 + .03,
                                        .02, .88)) for name in self.features]
         base = engine.norm_expected_6(engine.expit(sum(weights[i] * logits[i] for i in range(len(self.features)))))
+        # Feature scores are max-normalised (mean ~0.5) while the empirical hit
+        # rate averages 6/33, so the raw residual has a large negative bias.
+        # Adding it uncentred pushed every estimate under the floor and collapsed
+        # the ranking to a constant; centre it so it only tilts the base.
+        residual = residual - residual.mean() if rounds >= 3 else residual
         calibrated = engine.norm_expected_6(np.clip(base + self.lr * residual * engine.PICK, .02, None))
         gaps = np.zeros(engine.RED_N)
         for r in range(1, engine.RED_N + 1):
@@ -96,16 +115,24 @@ def _tickets_from_combos(combos, blues):
              "推荐蓝球": f"{blues[i % len(blues)]:02d}"} for i, combo in enumerate(combos)]
 
 
-def _generate_v3(inputs, actual, n_sets, variant):
+def _generate_v3(inputs, actual, n_sets, variant, cand_cache):
     high, mid, out, hot, gold, cold, last, regime, patterns, quota = inputs
-    kwargs = {"n_sets": n_sets, "diversity_limit": 3, "enforce_same_tail": True,
+    # Candidate pools depend only on (issue, enforce_same_tail); share them
+    # across ablation variants — generation rng is seeded by issue, so results
+    # are identical to generating per variant, at a fraction of the cost.
+    same_tail = variant != "no_same_tail_filter"
+    key = (actual.issue, same_tail)
+    if key not in cand_cache:
+        cand_cache[key] = engine.generate_v3_candidate_combos(
+            high, mid, out, last, actual.issue, regime, patterns,
+            n_sets=n_sets, enforce_same_tail=same_tail)
+    raw_main, raw_hedge, b_primary, b_secondary = cand_cache[key]
+    kwargs = {"n_sets": n_sets, "diversity_limit": 3,
               "include_blue_triad": True, "require_min_jaccard": True}
     if variant == "no_overlap_cap":
         kwargs.update(diversity_limit=6, require_min_jaccard=False)
-    elif variant == "no_same_tail_filter":
-        kwargs["enforce_same_tail"] = False
-    generated = engine.generate_v3_optimal_tickets(
-        high, mid, out, hot, gold, cold, last, actual.issue, regime, patterns, quota, **kwargs)
+    generated = engine.select_v3_tickets_from_candidates(
+        raw_main, raw_hedge, hot, gold, cold, b_primary, b_secondary, quota, **kwargs)
     combos = [sorted(int(x) for x in ticket["推荐红球"].split()) for ticket in generated]
     # V3 generator's internal fallback could relax overlap to four; enforce the
     # baseline cap here and allow the resulting shortfall to remain visible.
@@ -259,13 +286,14 @@ def run_audit(draws: Sequence, periods=500, n_sets=5, random_replicates=32, boot
     names = ["single_banker_baseline"] + ablations
     rows_by_name = {name: [] for name in names}
     random_runs = [[] for _ in range(random_replicates)]
+    cand_cache = {}
     detail = []
 
     for idx in range(start, len(draws)):
         actual = draws[idx]
         inputs = _prepare(draws[:idx], n_sets, calibrator)
         high, mid, out, hot, gold, cold, last, regime, patterns, _ = inputs
-        portfolios = {name: _generate_v3(inputs, actual, n_sets, name) for name in ablations}
+        portfolios = {name: _generate_v3(inputs, actual, n_sets, name, cand_cache) for name in ablations}
         portfolios["single_banker_baseline"] = engine.generate_v2_baseline_tickets(
             high, mid, out, hot, gold, cold, last, actual.issue, regime, patterns, n_sets)
         common = _common_ticket_count(list(portfolios.values()), n_sets)
