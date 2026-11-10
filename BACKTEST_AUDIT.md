@@ -8,6 +8,8 @@ Run the long-window default (500 out-of-sample periods):
 python ssq_backtest_audit.py --eval 500 --sets 5 --random-replicates 32
 ```
 
+Periods are scored by a pool of worker processes (`--workers`, default `min(4, CPU count)`); pass `--workers 1` to run serially. Each period depends only on its own history prefix and an issue-seeded RNG, and results are collected in period order, so the report is identical for any worker count.
+
 The report is written to `ssq_backtest_audit.json`. Historical data must contain at least 200 validated draws, and the requested window must leave at least 50 training draws. All schemes are evaluated on the same minimum actual ticket count for each target period; generated shortfalls are recorded separately and cost/ROI use only tickets actually evaluated.
 
 The single-banker comparator uses the current code's `generate_v2_baseline_tickets` implementation. It is an explicit new baseline, **not a faithful historical V2 reconstruction**, because the original V2 implementation is not present in this repository. The random comparator uniformly samples legal SSQ tickets and does not apply the V3 shape filters; therefore it compares with ordinary random play, not a matched-shape control. Ablations compare overlap-cap, same-tail and blue selection variants against the strict overlap-cap baseline.

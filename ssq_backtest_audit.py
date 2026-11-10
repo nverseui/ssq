@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
+import os
 import random
 from collections import Counter
 from pathlib import Path
@@ -190,12 +192,17 @@ def _bootstrap(differences, replicates=4000, block=10, seed=982451653):
         return {"mean_difference": 0.0, "ci95": [0.0, 0.0], "two_sided_p": 1.0,
                 "replicates": replicates, "block_length": block}
     rng = random.Random(seed)
+    # Pre-materialise every possible moving-block window once; the resampling
+    # loop then only copies list slices instead of rebuilding them element-wise.
+    repeats = 2 + block // max(n, 1)
+    doubled = list(differences) * repeats
+    segments = [doubled[start:start + block] for start in range(n)]
     samples = []
     for _ in range(replicates):
         chosen = []
         while len(chosen) < n:
             start = rng.randrange(n)
-            chosen.extend(differences[(start + i) % n] for i in range(block))
+            chosen.extend(segments[start])
         samples.append(fmean(chosen[:n]))
     samples.sort()
     lower = (sum(x <= 0 for x in samples) + 1) / (replicates + 1)
@@ -212,17 +219,21 @@ def _bootstrap_vs_random(left, random_runs, metric, replicates=4000, block=10, s
     if not n or not random_runs:
         return _bootstrap([], replicates, block, seed)
     rng = random.Random(seed)
+    # Pre-compute each replicate's moving-block contrasts so the resampling loop
+    # only does list copies. Random calls stay in the same order, so the test is
+    # numerically identical to recomputing left[i] - rep[i] element by element.
+    left_vals = np.array([row[metric] for row in left], dtype=float)
+    reps = [np.array([row[metric] for row in run], dtype=float) for run in random_runs]
+    repeats = 2 + block // max(n, 1)
+    tables = [[np.tile(left_vals - arr, repeats)[start:start + block].tolist()
+               for start in range(n)] for arr in reps]
     samples = []
     for _ in range(replicates):
         contrasts = []
         while len(contrasts) < n:
             start = rng.randrange(n)
-            rep = random_runs[rng.randrange(len(random_runs))]
-            for offset in range(block):
-                i = (start + offset) % n
-                contrasts.append(left[i][metric] - rep[i][metric])
-                if len(contrasts) >= n:
-                    break
+            rep = rng.randrange(len(random_runs))
+            contrasts.extend(tables[rep][start])
         samples.append(fmean(contrasts[:n]))
     samples.sort()
     lower = (sum(x <= 0 for x in samples) + 1) / (replicates + 1)
@@ -258,6 +269,51 @@ def _prepare(train, n_sets, calibrator):
     return high, mid, out, hot, gold, cold, train[-1], regime, patterns, quota
 
 
+_WORKER_STATE = None
+
+
+def _init_worker(draws, n_sets, random_replicates):
+    """Per-process state: draws, ticket count, and a private calibrator cache."""
+    global _WORKER_STATE
+    _WORKER_STATE = (draws, n_sets, random_replicates,
+                     StableAuditCalibrator(window=20, lr=.35, miss_tilt=engine.DEFAULT_TILT), {})
+
+
+def _audit_period(idx):
+    """Score one held-out period. Deterministic: seeds depend only on the issue."""
+    draws, n_sets, random_replicates, calibrator, cand_cache = _WORKER_STATE
+    actual = draws[idx]
+    inputs = _prepare(draws[:idx], n_sets, calibrator)
+    high, mid, out, hot, gold, cold, last, regime, patterns, _ = inputs
+    ablations = ["baseline", "no_overlap_cap", "no_same_tail_filter", "fixed_hot_blue"]
+    names = ["single_banker_baseline"] + ablations
+    portfolios = {name: _generate_v3(inputs, actual, n_sets, name, cand_cache) for name in ablations}
+    portfolios["single_banker_baseline"] = engine.generate_v2_baseline_tickets(
+        high, mid, out, hot, gold, cold, last, actual.issue, regime, patterns, n_sets)
+    common = _common_ticket_count(list(portfolios.values()), n_sets)
+    period_detail = {"issue": actual.issue, "requested_tickets": n_sets,
+                     "common_evaluated_tickets": common, "generated_tickets": {}, "schemes": {}}
+    rows = {}
+    for name in names:
+        generated = portfolios[name]
+        period_detail["generated_tickets"][name] = len(generated)
+        evaluated = generated[:common]
+        result = _score(evaluated, actual)
+        result["missing_tickets"] = n_sets - len(generated)
+        if name == "baseline":
+            result["overlap_max"] = max((len(set(a["推荐红球"].split()) & set(b["推荐红球"].split()))
+                                         for j, a in enumerate(evaluated) for b in evaluated[j + 1:]), default=0)
+        rows[name] = result
+        period_detail["schemes"][name] = result
+    random_rows = []
+    for rep in range(random_replicates):
+        random_portfolio = _uniform_tickets(common, seed=actual.issue * 1009 + rep)
+        random_result = _score(random_portfolio, actual)
+        random_result["missing_tickets"] = n_sets - common
+        random_rows.append(random_result)
+    return period_detail, rows, random_rows
+
+
 def _aggregate(rows):
     tickets = sum(row["tickets"] for row in rows)
     cost = sum(row["cost_yuan"] for row in rows)
@@ -272,7 +328,8 @@ def _aggregate(rows):
             "prize_counts": dict(sum((Counter(row["prizes"]) for row in rows), Counter()))}
 
 
-def run_audit(draws: Sequence, periods=500, n_sets=5, random_replicates=32, bootstrap_replicates=4000):
+def run_audit(draws: Sequence, periods=500, n_sets=5, random_replicates=32, bootstrap_replicates=4000,
+              workers=1):
     if len(draws) < engine.MIN_HISTORY_DRAWS:
         raise ValueError(f"need at least {engine.MIN_HISTORY_DRAWS} valid historical draws; got {len(draws)}")
     if periods < 10 or periods > len(draws) - 50:
@@ -281,41 +338,32 @@ def run_audit(draws: Sequence, periods=500, n_sets=5, random_replicates=32, boot
         raise ValueError("sets must be 1..20, random-replicates >=2, bootstrap-replicates >=100")
 
     start = len(draws) - periods
-    calibrator = StableAuditCalibrator(window=20, lr=.35, miss_tilt=engine.DEFAULT_TILT)
     ablations = ["baseline", "no_overlap_cap", "no_same_tail_filter", "fixed_hot_blue"]
     names = ["single_banker_baseline"] + ablations
     rows_by_name = {name: [] for name in names}
     random_runs = [[] for _ in range(random_replicates)]
-    cand_cache = {}
     detail = []
 
-    for idx in range(start, len(draws)):
-        actual = draws[idx]
-        inputs = _prepare(draws[:idx], n_sets, calibrator)
-        high, mid, out, hot, gold, cold, last, regime, patterns, _ = inputs
-        portfolios = {name: _generate_v3(inputs, actual, n_sets, name, cand_cache) for name in ablations}
-        portfolios["single_banker_baseline"] = engine.generate_v2_baseline_tickets(
-            high, mid, out, hot, gold, cold, last, actual.issue, regime, patterns, n_sets)
-        common = _common_ticket_count(list(portfolios.values()), n_sets)
-        period_detail = {"issue": actual.issue, "requested_tickets": n_sets,
-                         "common_evaluated_tickets": common, "generated_tickets": {}, "schemes": {}}
-        for name in names:
-            generated = portfolios[name]
-            period_detail["generated_tickets"][name] = len(generated)
-            evaluated = generated[:common]
-            result = _score(evaluated, actual)
-            result["missing_tickets"] = n_sets - len(generated)
-            if name == "baseline":
-                result["overlap_max"] = max((len(set(a["推荐红球"].split()) & set(b["推荐红球"].split()))
-                                             for j, a in enumerate(evaluated) for b in evaluated[j + 1:]), default=0)
-            rows_by_name[name].append(result)
-            period_detail["schemes"][name] = result
-        for rep in range(random_replicates):
-            random_portfolio = _uniform_tickets(common, seed=actual.issue * 1009 + rep)
-            random_result = _score(random_portfolio, actual)
-            random_result["missing_tickets"] = n_sets - common
-            random_runs[rep].append(random_result)
+    # Each period depends only on its own history prefix and its issue-seeded RNG,
+    # so periods can be scored in parallel without changing any result. The map
+    # preserves index order, keeping aggregation bit-for-bit deterministic.
+    indices = list(range(start, len(draws)))
+    if workers > 1 and len(indices) >= 20:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=min(workers, len(indices)),
+                      initializer=_init_worker,
+                      initargs=(draws, n_sets, random_replicates)) as pool:
+            results = pool.map(_audit_period, indices, chunksize=4)
+    else:
+        _init_worker(draws, n_sets, random_replicates)
+        results = [_audit_period(idx) for idx in indices]
+
+    for period_detail, rows, random_rows in results:
         detail.append(period_detail)
+        for name in names:
+            rows_by_name[name].append(rows[name])
+        for rep, random_result in enumerate(random_rows):
+            random_runs[rep].append(random_result)
 
     # Per-period mean over random replicates; all portfolios have equal ticket count.
     random_mean_rows = []
@@ -371,6 +419,8 @@ def main():
     parser.add_argument("--sets", type=int, default=5)
     parser.add_argument("--random-replicates", type=int, default=32)
     parser.add_argument("--bootstrap-replicates", type=int, default=4000)
+    parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                        help="parallel period workers; results are identical for any value (default: up to 4)")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("ssq_backtest_audit.json"))
@@ -378,7 +428,8 @@ def main():
     if args.eval < 10 or not 1 <= args.sets <= 20 or args.random_replicates < 2 or args.bootstrap_replicates < 100:
         parser.error("eval>=10, sets=1..20, random-replicates>=2, bootstrap-replicates>=100 are required")
     draws = engine.load_verified_cwl_data(offline=args.offline, force_refresh=args.force_refresh)
-    report = run_audit(draws, args.eval, args.sets, args.random_replicates, args.bootstrap_replicates)
+    report = run_audit(draws, args.eval, args.sets, args.random_replicates, args.bootstrap_replicates,
+                       workers=args.workers)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"回测期号: {report['issue_range'][0]}–{report['issue_range'][1]}")
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))

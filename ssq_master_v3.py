@@ -471,30 +471,33 @@ def is_valid_shape_advanced(reds: Sequence[int], last: Draw, regime_invert: bool
                             enforce_same_tail: bool = True) -> bool:
     s = sum(reds)
     if not (75 <= s <= 130): return False
+    if reds[-1] - reds[0] < 18: return False
     odds = sum(1 for x in reds if x % 2 == 1)
     if odds not in (2, 3, 4): return False
-    if reds[-1] - reds[0] < 18: return False
+    if enforce_same_tail and len({x % 10 for x in reds}) > 5:
+        return False
+
+    # Cheap sequential/geometry checks run before the O(15) difference set.
+    prev, c, mc = reds[0], 1, 1
+    for i in range(1, 6):
+        cur = reds[i]
+        if cur == prev + 1:
+            c += 1
+            if c > mc:
+                mc = c
+        else:
+            c = 1
+        prev = cur
+    if mc > 3: return False
 
     diffs = {abs(reds[i] - reds[j]) for i in range(6) for j in range(i + 1, 6)}
     if not (4 <= len(diffs) - 5 <= 8): return False
 
-    if enforce_same_tail and len({x % 10 for x in reds}) > 5:
-        return False
-
-    s2 = reds  # callers always pass sorted combos; span check above already relies on it
-    c, mc = 1, 1
-    for i in range(1, 6):
-        if s2[i] == s2[i - 1] + 1:
-            c += 1
-            mc = max(mc, c)
-        else:
-            c = 1
-    if mc > 3: return False
-
-    coords = [((r - 1) // 6, (r - 1) % 6) for r in reds]
-    if coords[-1][0] < 4: return False
-    if coords[-1][0] - coords[0][0] < 3: return False
-    if max(c[1] for c in coords) - min(c[1] for c in coords) < 4: return False
+    rows = [(r - 1) // 6 for r in reds]
+    if rows[-1] < 4: return False
+    if rows[-1] - rows[0] < 3: return False
+    cols = [(r - 1) % 6 for r in reds]
+    if max(cols) - min(cols) < 4: return False
 
     if last is not None:
         if len(set(reds) & set(last.reds)) > 3: return False
@@ -506,8 +509,8 @@ def is_valid_shape_advanced(reds: Sequence[int], last: Draw, regime_invert: bool
             if last.zones_3[q] == 0 and zc[q] == 0: return False
         if not regime_invert and not any(zc[q] == last.zones_3[q] for q in range(3)):
             return False
-        rc = {abs(coords[i + 1][0] - coords[i][0]) for i in range(5)}
-        cc = {abs(coords[i + 1][1] - coords[i][1]) for i in range(5)}
+        rc = {abs(rows[i + 1] - rows[i]) for i in range(5)}
+        cc = {abs(cols[i + 1] - cols[i]) for i in range(5)}
         rp, cp = last.row_col_dists
         if not (bool(rc & set(rp)) or bool(cc & set(cp))): return False
 
@@ -619,7 +622,7 @@ def generate_v3_candidate_combos(high_r: List[int], mid_r: List[int], out_r: Lis
     for _ in range(30000):
         if len(raw_main) >= n_sets * 8: break
         cur_b = b_primary if rng.random() < 0.60 else b_secondary
-        c = sorted([cur_b] + rng.choice(legs_arr, 4, replace=False).tolist() + [rng.choice(mid_out_main)])
+        c = sorted([cur_b] + rng.choice(legs_arr, 4, replace=False).tolist() + [mid_out_main[rng.integers(mid_out_main.size)]])
         if tuple(c) in seen: continue
         if len(set(c)) == 6 and is_valid_shape_advanced(c, last, regime_invert, patterns, enforce_same_tail):
             seen.add(tuple(c))
@@ -631,7 +634,7 @@ def generate_v3_candidate_combos(high_r: List[int], mid_r: List[int], out_r: Lis
     for _ in range(20000):
         if len(raw_hedge) >= n_sets * 4: break
         cur_b = b_primary if rng_h.random() < 0.50 else b_secondary
-        c = sorted([cur_b] + rng_h.choice(legs_arr, 4, replace=False).tolist() + [rng_h.choice(mid_out_all)])
+        c = sorted([cur_b] + rng_h.choice(legs_arr, 4, replace=False).tolist() + [mid_out_all[rng_h.integers(mid_out_all.size)]])
         if tuple(c) in seen: continue
         if len(set(c)) == 6 and is_valid_shape_advanced(c, last, regime_invert, patterns, enforce_same_tail=False):
             sp = len({x % 10 for x in c})
