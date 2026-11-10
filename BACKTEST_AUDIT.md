@@ -1,26 +1,15 @@
 # SSQ research audit runner
 
-This research harness is isolated from the ticket-generation CLI. It borrows the useful evaluation practices from open-source SSQ/lottery repositories: strict walk-forward evaluation, a uniform-random null, exact single-ticket theoretical odds, repeated random seeds, paired moving-block bootstrap intervals, and Holm correction for multiple ablation comparisons.
+The isolated `ssq_backtest_audit.py` research runner performs strict walk-forward evaluation, compares the current V3 generator to an explicit single-banker baseline and uniform random tickets, computes exact single-ticket theoretical odds, repeats random controls, reports paired moving-block bootstrap intervals, and Holm-adjusts the comparison p-values.
 
-## Run
+Run the long-window default (500 out-of-sample periods):
 
 ```bash
-python ssq_backtest_audit.py --eval 30 --sets 5 --random-replicates 32
+python ssq_backtest_audit.py --eval 500 --sets 5 --random-replicates 32
 ```
 
-The script uses the existing official-data loader and requires at least 200 validated historical draws. It writes `ssq_backtest_audit.json` with period-level details, actual ticket counts and shortfalls, wins, fixed-prize returns, costs, ROI, random-null distribution, theoretical probabilities, bootstrap intervals, and Holm-adjusted p-values.
+The report is written to `ssq_backtest_audit.json`. Historical data must contain at least 200 validated draws, and the requested window must leave at least 50 training draws. All schemes are evaluated on the same minimum actual ticket count for each target period; generated shortfalls are recorded separately and cost/ROI use only tickets actually evaluated.
 
-## Ablations
+The single-banker comparator uses the current code's `generate_v2_baseline_tickets` implementation. It is an explicit new baseline, **not a faithful historical V2 reconstruction**, because the original V2 implementation is not present in this repository. The random comparator uniformly samples legal SSQ tickets and does not apply the V3 shape filters; therefore it compares with ordinary random play, not a matched-shape control. Ablations compare overlap-cap, same-tail and blue selection variants against the strict overlap-cap baseline.
 
-The report compares the strict final overlap-cap baseline with: no pairwise overlap cap, no same-tail restriction, and a fixed hot-blue selection. It reports missed tickets and maximum pairwise red overlap. The `no_overlap_cap` variant is not to be interpreted as a Jaccard improvement; the production condition is a **red-number intersection cap** (not Jaccard similarity). The baseline post-filters generated tickets and reports a shortfall rather than claiming the cap held when it did not.
-
-## Interpretation and caveats
-
-- The included V3 generator and its shape filters are heuristic. No gain is presumed.
-- The audit uses `StableAuditCalibrator`, a research-only calibration path that normalizes inverse-MSE weights directly to avoid overflow/NaN. This does **not** silently change the production `OptimalCalibrator`; promote a calibration change only after a separately reviewed code change and regression tests.
-- The random null is uniform over legal SSQ combinations, without the V3 shape filters. That is appropriate for the question “does the filtered strategy beat an ordinary random ticket?” but is not a matched-shape control. A future study can add a matched-constraint random null.
-- Fixed prize values follow `eval_prize`; first/second prizes are variable in practice, so reported ROI is an estimate, not actual historic payout or a guarantee.
-- A small test window has weak power, especially for rare large prizes. Read confidence intervals and corrected p-values; do not conclude predictive advantage from raw win rate or a lucky payout.
-- `period_details` make every period and each ablation auditable. Exact theoretical probabilities are per-ticket; multi-ticket probabilities depend on ticket overlap and are evaluated empirically against the random null.
-
-The conceptual sources reviewed for this approach are [`alf1ei/lottery-backtest`](https://github.com/alf1ei/lottery-backtest) (walk-forward/random/theoretical baseline) and [`ioi-studio/IOI-LottoLab`](https://github.com/ioi-studio/IOI-LottoLab) (seed robustness and paired block bootstrap). No third-party predictor code is copied into this repository.
+Prize returns use fixed estimates in `ssq_master_v3.eval_prize`. First and second prizes are floating in real play, so ROI is only an estimate. Read the confidence intervals and Holm-adjusted p-values; do not infer a future predictive advantage from raw historical results. The audit calibrator is research-only and does not silently alter production prediction code.
